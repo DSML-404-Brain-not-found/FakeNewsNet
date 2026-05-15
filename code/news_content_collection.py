@@ -1,6 +1,9 @@
+import csv
 import json
 import logging
+import shutil
 import time
+from pathlib import Path
 
 import requests
 from tqdm import tqdm
@@ -113,7 +116,7 @@ def get_website_url_from_arhieve(url):
 def crawl_news_article(url):
     news_article = crawl_link_article(url)
 
-    # If the news article could not be fetched from original website, fetch from archieve if it exists.
+    # If the news article could not be fetched from original website, fetch from archive if it exists.
     if news_article is None:
         archieve_url = get_website_url_from_arhieve(url)
         if archieve_url is not None:
@@ -122,19 +125,68 @@ def crawl_news_article(url):
     return news_article
 
 
+def append_news_content_failure(log_path, news_source, label, news, folder_path, reason):
+    log_path = Path(log_path)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    file_exists = log_path.exists()
+
+    with log_path.open("a", encoding="utf-8", newline="") as f:
+        fieldnames = ["news_source", "label", "news_id", "title", "url", "folder_path", "reason"]
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow({
+            "news_source": news_source,
+            "label": label,
+            "news_id": news.news_id,
+            "title": news.news_title,
+            "url": news.news_url,
+            "folder_path": str(folder_path),
+            "reason": reason,
+        })
+
+
+def remove_failed_news_folder(news_dir):
+    news_dir = Path(news_dir)
+    if news_dir.exists() and news_dir.is_dir():
+        shutil.rmtree(str(news_dir))
+
+
 def collect_news_articles(news_list, news_source, label, config: Config):
     create_dir(config.dump_location)
     create_dir("{}/{}".format(config.dump_location, news_source))
     create_dir("{}/{}/{}".format(config.dump_location, news_source, label))
 
-    save_dir = "{}/{}/{}".format(config.dump_location, news_source, label)
+    save_dir = Path("{}/{}/{}".format(config.dump_location, news_source, label))
+    failure_log_path = Path(config.dump_location) / "logs" / "news_content_failures.csv"
 
     for news in tqdm(news_list):
-        create_dir("{}/{}".format(save_dir, news.news_id))
+        news_dir = save_dir / news.news_id
+        create_dir(str(news_dir))
+
         news_article = crawl_news_article(news.news_url)
         if news_article:
-            json.dump(news_article,
-                      open("{}/{}/news content.json".format(save_dir, news.news_id), "w", encoding="UTF-8"))
+            json.dump(
+                news_article,
+                open(str(news_dir / "news content.json"), "w", encoding="UTF-8"),
+            )
+        else:
+            append_news_content_failure(
+                failure_log_path,
+                news_source,
+                label,
+                news,
+                news_dir,
+                reason="crawl_or_parse_failed",
+            )
+            logging.info(
+                "Failed to collect news content. Removed folder. source=%s label=%s news_id=%s url=%s",
+                news_source,
+                label,
+                news.news_id,
+                news.news_url,
+            )
+            remove_failed_news_folder(news_dir)
 
 
 class NewsContentCollector(DataCollector):
