@@ -5,8 +5,13 @@ prepare_fakenewsnet_dataset.py
 Purpose
 -------
 After cloning/downloading FakeNewsNet and collecting news content, this script organizes
-text metadata and downloads news images from `top_img` / `images` URLs. Failed image
-URLs are recorded in logs. All downloaded images are finally compressed into a zip file.
+text metadata and downloads two image versions:
+
+1) Full image version: downloads `top_img` plus all URLs in `images`.
+2) Strict top_img-only version: downloads only the URL stored in `top_img`.
+
+Failed image URLs are recorded in logs. Both image versions are compressed into separate
+zip files.
 
 Expected input structure
 ------------------------
@@ -43,16 +48,16 @@ prepared_fakenewsnet/
 ├── metadata/
 │   ├── news_metadata.jsonl
 │   └── news_metadata.csv
-├── images/
-│   ├── gossipcop/
-│   │   ├── fake/
-│   │   └── real/
-│   └── politifact/
+├── images/                         # full version: top_img + images
+├── images_top_img/                 # strict top_img-only version
 ├── logs/
-│   ├── image_download_failures.csv
 │   ├── image_download_success.csv
+│   ├── image_download_failures.csv
+│   ├── top_img_download_success.csv
+│   ├── top_img_download_failures.csv
 │   └── run_summary.json
-└── fakenewsnet_images.zip
+├── fakenewsnet_images.zip
+└── fakenewsnet_top_img_only.zip
 """
 
 from __future__ import annotations
@@ -62,7 +67,6 @@ import csv
 import hashlib
 import json
 import mimetypes
-import os
 import re
 import shutil
 import sys
@@ -70,7 +74,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Iterable, List, Optional, Tuple
 from urllib.parse import urlparse
 
 try:
@@ -84,7 +88,6 @@ except ImportError as exc:
 
 DEFAULT_DATASETS = ("gossipcop", "politifact")
 DEFAULT_LABELS = ("fake", "real")
-IMAGE_FIELDS = ("top_img", "images")
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
@@ -102,7 +105,7 @@ class NewsRecord:
     publish_date: str = ""
     source: str = ""
     top_img: str = ""
-    image_urls: str = ""  # pipe-separated string for CSV compatibility
+    image_urls: str = ""  # pipe-separated string for CSV compatibility; top_img + images
     json_path: str = ""
     csv_path: str = ""
 
@@ -115,6 +118,7 @@ class ImageJob:
     image_index: int
     url: str
     output_dir: str
+    image_version: str = "full"  # full / top_img_only
 
 
 @dataclass
@@ -125,6 +129,7 @@ class DownloadResult:
     news_id: str
     image_index: int
     url: str
+    image_version: str = "full"
     file_path: str = ""
     error_type: str = ""
     error_message: str = ""
@@ -135,7 +140,10 @@ class DownloadResult:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Organize FakeNewsNet text metadata, download images, log failures, and zip images."
+        description=(
+            "Organize FakeNewsNet text metadata, download full images and strict top_img-only images, "
+            "log failures, and zip both versions."
+        )
     )
     parser.add_argument(
         "--input-root",
@@ -195,12 +203,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--no-download-images",
         action="store_true",
-        help="Only export text metadata; do not download images.",
+        help="Only export text metadata; do not download or zip images.",
+    )
+    parser.add_argument(
+        "--skip-full-images",
+        action="store_true",
+        help="Skip full image download and zip; only process strict top_img-only images.",
+    )
+    parser.add_argument(
+        "--skip-top-img-only",
+        action="store_true",
+        help="Skip strict top_img-only image download and zip; only process full images.",
     )
     parser.add_argument(
         "--zip-name",
         default="fakenewsnet_images",
-        help="Zip filename without .zip. Default: fakenewsnet_images",
+        help="Full image zip filename without .zip. Default: fakenewsnet_images",
+    )
+    parser.add_argument(
+        "--top-img-zip-name",
+        default="fakenewsnet_top_img_only",
+        help="Strict top_img-only zip filename without .zip. Default: fakenewsnet_top_img_only",
     )
     return parser.parse_args()
 
@@ -239,13 +262,16 @@ def stable_news_id(raw: str) -> str:
     return "unknown"
 
 
+def valid_http_urls(urls: Iterable[str]) -> List[str]:
+    return list(dict.fromkeys([u for u in urls if u.startswith(("http://", "https://"))]))
+
+
 def iter_news_json_paths(input_root: Path, datasets: Iterable[str], labels: Iterable[str]) -> Iterable[Tuple[str, str, Path]]:
     for dataset in datasets:
         for label in labels:
             base = input_root / dataset / label
             if not base.exists():
                 continue
-            # Common filename is exactly "news content.json".
             for json_path in base.rglob("*.json"):
                 if json_path.name.lower() == "news content.json":
                     yield dataset, label, json_path
@@ -255,15 +281,14 @@ def load_json_record(dataset: str, label: str, json_path: Path, input_root: Path
     with json_path.open("r", encoding="utf-8") as f:
         data = json.load(f)
 
-    # Parent directory is usually the article/news id.
     news_id = stable_news_id(json_path.parent.name)
-    top_img = safe_str(data.get("top_img", ""))
+    top_img_urls = valid_http_urls(normalize_url_list(data.get("top_img")))
+    top_img = top_img_urls[0] if top_img_urls else ""
 
     urls: List[str] = []
-    urls.extend(normalize_url_list(data.get("top_img")))
+    urls.extend(top_img_urls)
     urls.extend(normalize_url_list(data.get("images")))
-    # Preserve order while removing duplicates.
-    urls = list(dict.fromkeys([u for u in urls if u.startswith(("http://", "https://"))]))
+    urls = valid_http_urls(urls)
 
     return NewsRecord(
         dataset=dataset,
@@ -296,10 +321,17 @@ def load_csv_records(dataset: str, label: str, csv_path: Path, input_root: Path)
             news_id = stable_news_id(
                 row.get("id") or row.get("news_id") or row.get("article_id") or f"{dataset}_{label}_{i}"
             )
+            top_img_urls = valid_http_urls(
+                normalize_url_list(row.get("top_img") or row.get("image_url") or row.get("img_url") or row.get("image"))
+            )
+            top_img = top_img_urls[0] if top_img_urls else ""
+
             url_candidates: List[str] = []
-            for key in ("top_img", "image", "image_url", "img_url", "url"):
+            url_candidates.extend(top_img_urls)
+            for key in ("images", "image_urls", "image", "image_url", "img_url"):
                 url_candidates.extend(normalize_url_list(row.get(key)))
-            image_urls = [u for u in url_candidates if u.startswith(("http://", "https://"))]
+            image_urls = valid_http_urls(url_candidates)
+
             records.append(
                 NewsRecord(
                     dataset=dataset,
@@ -310,8 +342,8 @@ def load_csv_records(dataset: str, label: str, csv_path: Path, input_root: Path)
                     url=safe_str(row.get("news_url", row.get("url", ""))),
                     publish_date=safe_str(row.get("publish_date", row.get("date", ""))),
                     source=safe_str(row.get("source", "")),
-                    top_img=safe_str(row.get("top_img", row.get("image_url", ""))),
-                    image_urls="|".join(dict.fromkeys(image_urls)),
+                    top_img=top_img,
+                    image_urls="|".join(image_urls),
                     csv_path=str(csv_path.relative_to(input_root)),
                 )
             )
@@ -335,7 +367,6 @@ def collect_records(input_root: Path, datasets: Iterable[str], labels: Iterable[
         try:
             for record in load_csv_records(dataset, label, csv_path, input_root):
                 key = (record.dataset, record.label, record.news_id)
-                # Prefer full JSON record when duplicated.
                 if key not in seen_keys:
                     seen_keys.add(key)
                     records.append(record)
@@ -367,7 +398,7 @@ def write_metadata(records: List[NewsRecord], output_root: Path) -> None:
 def extension_from_response(url: str, content_type: str) -> str:
     parsed = urlparse(url)
     ext = Path(parsed.path).suffix.lower()
-    if ext in {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tiff"}:
+    if ext in {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tiff", ".svg", ".ico"}:
         return ext
     if content_type:
         guessed = mimetypes.guess_extension(content_type.split(";")[0].strip())
@@ -395,6 +426,7 @@ def download_one(job: ImageJob, timeout: int, retries: int, sleep: float, overwr
             news_id=job.news_id,
             image_index=job.image_index,
             url=job.url,
+            image_version=job.image_version,
             error_type="invalid_url",
             error_message="URL does not start with http:// or https://",
         )
@@ -404,7 +436,7 @@ def download_one(job: ImageJob, timeout: int, retries: int, sleep: float, overwr
     last_status = ""
     last_content_type = ""
 
-    for attempt in range(retries + 1):
+    for _attempt in range(retries + 1):
         try:
             if sleep > 0:
                 time.sleep(sleep)
@@ -435,6 +467,7 @@ def download_one(job: ImageJob, timeout: int, retries: int, sleep: float, overwr
                     news_id=job.news_id,
                     image_index=job.image_index,
                     url=job.url,
+                    image_version=job.image_version,
                     file_path=str(file_path),
                     http_status=last_status,
                     content_type=content_type,
@@ -451,7 +484,7 @@ def download_one(job: ImageJob, timeout: int, retries: int, sleep: float, overwr
             if size == 0:
                 try:
                     file_path.unlink(missing_ok=True)
-                except TypeError:  # Python < 3.8 fallback
+                except TypeError:
                     if file_path.exists():
                         file_path.unlink()
                 last_error_type = "empty_file"
@@ -465,6 +498,7 @@ def download_one(job: ImageJob, timeout: int, retries: int, sleep: float, overwr
                 news_id=job.news_id,
                 image_index=job.image_index,
                 url=job.url,
+                image_version=job.image_version,
                 file_path=str(file_path),
                 http_status=last_status,
                 content_type=content_type,
@@ -488,6 +522,7 @@ def download_one(job: ImageJob, timeout: int, retries: int, sleep: float, overwr
         news_id=job.news_id,
         image_index=job.image_index,
         url=job.url,
+        image_version=job.image_version,
         error_type=last_error_type,
         error_message=last_error,
         http_status=last_status,
@@ -495,7 +530,7 @@ def download_one(job: ImageJob, timeout: int, retries: int, sleep: float, overwr
     )
 
 
-def build_image_jobs(records: List[NewsRecord], output_root: Path) -> List[ImageJob]:
+def build_full_image_jobs(records: List[NewsRecord], output_root: Path) -> List[ImageJob]:
     jobs: List[ImageJob] = []
     for record in records:
         urls = [u for u in record.image_urls.split("|") if u.strip()]
@@ -508,17 +543,38 @@ def build_image_jobs(records: List[NewsRecord], output_root: Path) -> List[Image
                     image_index=idx,
                     url=url.strip(),
                     output_dir=str(output_root / "images" / record.dataset / record.label),
+                    image_version="full",
                 )
             )
     return jobs
 
 
-def write_download_logs(results: List[DownloadResult], output_root: Path) -> None:
+def build_top_img_jobs(records: List[NewsRecord], output_root: Path) -> List[ImageJob]:
+    jobs: List[ImageJob] = []
+    for record in records:
+        top_img = record.top_img.strip()
+        if not top_img:
+            continue
+        jobs.append(
+            ImageJob(
+                dataset=record.dataset,
+                label=record.label,
+                news_id=record.news_id,
+                image_index=0,
+                url=top_img,
+                output_dir=str(output_root / "images_top_img" / record.dataset / record.label),
+                image_version="top_img_only",
+            )
+        )
+    return jobs
+
+
+def write_download_logs(results: List[DownloadResult], output_root: Path, success_name: str, failure_name: str) -> None:
     logs_dir = output_root / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
 
-    success_path = logs_dir / "image_download_success.csv"
-    failures_path = logs_dir / "image_download_failures.csv"
+    success_path = logs_dir / success_name
+    failures_path = logs_dir / failure_name
     fieldnames = list(asdict(DownloadResult("", "", "", "", 0, "")).keys())
 
     with success_path.open("w", encoding="utf-8", newline="") as f:
@@ -536,7 +592,7 @@ def write_download_logs(results: List[DownloadResult], output_root: Path) -> Non
                 writer.writerow(asdict(result))
 
 
-def download_images(jobs: List[ImageJob], args: argparse.Namespace) -> List[DownloadResult]:
+def download_images(jobs: List[ImageJob], args: argparse.Namespace, label: str) -> List[DownloadResult]:
     if not jobs:
         return []
 
@@ -552,38 +608,67 @@ def download_images(jobs: List[ImageJob], args: argparse.Namespace) -> List[Down
             if i % 50 == 0 or i == len(futures):
                 success = sum(1 for r in results if r.status == "success")
                 failed = sum(1 for r in results if r.status != "success")
-                print(f"[DOWNLOAD] {i}/{len(futures)} processed | success={success} failed/skipped={failed}")
+                print(f"[DOWNLOAD:{label}] {i}/{len(futures)} processed | success={success} failed/skipped={failed}")
     return results
 
 
-def zip_images(output_root: Path, zip_name: str) -> Optional[Path]:
-    images_dir = output_root / "images"
-    if not images_dir.exists():
+def zip_directory(output_root: Path, source_dir_name: str, zip_name: str) -> Optional[Path]:
+    source_dir = output_root / source_dir_name
+    if not source_dir.exists():
         return None
     zip_base = output_root / zip_name
-    zip_path = shutil.make_archive(str(zip_base), "zip", root_dir=images_dir)
+    zip_path = shutil.make_archive(str(zip_base), "zip", root_dir=source_dir)
     return Path(zip_path)
 
 
-def write_summary(records: List[NewsRecord], jobs: List[ImageJob], results: List[DownloadResult], output_root: Path, zip_path: Optional[Path]) -> None:
+def summarize_jobs_results(jobs: List[ImageJob], results: List[DownloadResult]) -> dict:
+    return {
+        "total_image_urls": len(jobs),
+        "download_success": sum(1 for r in results if r.status == "success"),
+        "download_failed_or_skipped": sum(1 for r in results if r.status != "success"),
+    }
+
+
+def write_summary(
+    records: List[NewsRecord],
+    full_jobs: List[ImageJob],
+    full_results: List[DownloadResult],
+    top_img_jobs: List[ImageJob],
+    top_img_results: List[DownloadResult],
+    output_root: Path,
+    full_zip_path: Optional[Path],
+    top_img_zip_path: Optional[Path],
+) -> None:
     logs_dir = output_root / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
     summary = {
         "total_records": len(records),
         "records_with_image_urls": sum(1 for r in records if r.image_urls),
-        "total_image_urls": len(jobs),
-        "download_success": sum(1 for r in results if r.status == "success"),
-        "download_failed_or_skipped": sum(1 for r in results if r.status != "success"),
-        "zip_path": str(zip_path) if zip_path else "",
+        "records_with_top_img": sum(1 for r in records if r.top_img),
+        "full_images": {
+            **summarize_jobs_results(full_jobs, full_results),
+            "zip_path": str(full_zip_path) if full_zip_path else "",
+            "image_dir": str(output_root / "images"),
+        },
+        "top_img_only": {
+            **summarize_jobs_results(top_img_jobs, top_img_results),
+            "zip_path": str(top_img_zip_path) if top_img_zip_path else "",
+            "image_dir": str(output_root / "images_top_img"),
+        },
         "by_dataset_label": {},
     }
 
     for record in records:
         key = f"{record.dataset}/{record.label}"
-        summary["by_dataset_label"].setdefault(key, {"records": 0, "records_with_image_urls": 0})
+        summary["by_dataset_label"].setdefault(
+            key,
+            {"records": 0, "records_with_image_urls": 0, "records_with_top_img": 0},
+        )
         summary["by_dataset_label"][key]["records"] += 1
         if record.image_urls:
             summary["by_dataset_label"][key]["records_with_image_urls"] += 1
+        if record.top_img:
+            summary["by_dataset_label"][key]["records_with_top_img"] += 1
 
     with (logs_dir / "run_summary.json").open("w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
@@ -599,6 +684,7 @@ def main() -> None:
 
     output_root.mkdir(parents=True, exist_ok=True)
     (output_root / "images").mkdir(parents=True, exist_ok=True)
+    (output_root / "images_top_img").mkdir(parents=True, exist_ok=True)
     (output_root / "logs").mkdir(parents=True, exist_ok=True)
 
     print(f"[INFO] Input root: {input_root.resolve()}")
@@ -609,22 +695,58 @@ def main() -> None:
     write_metadata(records, output_root)
     print(f"[INFO] Metadata exported to: {output_root / 'metadata'}")
 
-    jobs = build_image_jobs(records, output_root)
-    print(f"[INFO] Image URLs found: {len(jobs)}")
+    full_jobs: List[ImageJob] = []
+    top_img_jobs: List[ImageJob] = []
+    full_results: List[DownloadResult] = []
+    top_img_results: List[DownloadResult] = []
+    full_zip_path: Optional[Path] = None
+    top_img_zip_path: Optional[Path] = None
 
-    results: List[DownloadResult] = []
     if args.no_download_images:
-        print("[INFO] --no-download-images enabled; image download skipped.")
+        print("[INFO] --no-download-images enabled; image download and zip skipped.")
     else:
-        results = download_images(jobs, args)
-        write_download_logs(results, output_root)
-        print(f"[INFO] Download logs exported to: {output_root / 'logs'}")
+        if not args.skip_full_images:
+            full_jobs = build_full_image_jobs(records, output_root)
+            print(f"[INFO] Full image URLs found: {len(full_jobs)}")
+            full_results = download_images(full_jobs, args, "full")
+            write_download_logs(
+                full_results,
+                output_root,
+                success_name="image_download_success.csv",
+                failure_name="image_download_failures.csv",
+            )
+            full_zip_path = zip_directory(output_root, "images", args.zip_name)
+            if full_zip_path:
+                print(f"[INFO] Full images zipped to: {full_zip_path}")
+        else:
+            print("[INFO] --skip-full-images enabled; full image version skipped.")
 
-    zip_path = zip_images(output_root, args.zip_name) if not args.no_download_images else None
-    if zip_path:
-        print(f"[INFO] Images zipped to: {zip_path}")
+        if not args.skip_top_img_only:
+            top_img_jobs = build_top_img_jobs(records, output_root)
+            print(f"[INFO] Strict top_img URLs found: {len(top_img_jobs)}")
+            top_img_results = download_images(top_img_jobs, args, "top_img_only")
+            write_download_logs(
+                top_img_results,
+                output_root,
+                success_name="top_img_download_success.csv",
+                failure_name="top_img_download_failures.csv",
+            )
+            top_img_zip_path = zip_directory(output_root, "images_top_img", args.top_img_zip_name)
+            if top_img_zip_path:
+                print(f"[INFO] Strict top_img-only images zipped to: {top_img_zip_path}")
+        else:
+            print("[INFO] --skip-top-img-only enabled; top_img-only version skipped.")
 
-    write_summary(records, jobs, results, output_root, zip_path)
+    write_summary(
+        records,
+        full_jobs,
+        full_results,
+        top_img_jobs,
+        top_img_results,
+        output_root,
+        full_zip_path,
+        top_img_zip_path,
+    )
     print(f"[DONE] Summary written to: {output_root / 'logs' / 'run_summary.json'}")
 
 
